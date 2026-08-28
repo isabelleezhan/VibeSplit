@@ -1,18 +1,23 @@
 import secrets
 import time
+from typing import Annotated
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.db import get_db
+from app.models import User
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 SPOTIFY_AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SESSION_COOKIE_NAME = "session_id"
+SPOTIFY_API_BASE = "https://api.spotify.com/v1"
+USER_ID_COOKIE_NAME = "spotify_user_id"
 
 SCOPES = " ".join(
     [
@@ -22,20 +27,8 @@ SCOPES = " ".join(
     ]
 )
 
-# NOTE: Once Postgres is wired up, swap this for the `users` table and drop these
-# process-global dicts
+# Short-lived CSRF guard for the login->callback round trip 
 _pending_states: set[str] = set()
-_sessions: dict[str, dict] = {}
-
-
-def _store_session(token_data: dict) -> str:
-    session_id = secrets.token_urlsafe(24)
-    _sessions[session_id] = {
-        "access_token": token_data["access_token"],
-        "refresh_token": token_data.get("refresh_token"),
-        "expires_at": time.time() + token_data.get("expires_in", 3600),
-    }
-    return session_id
 
 
 @router.get("/login")
@@ -61,7 +54,7 @@ def login() -> RedirectResponse:
 
 
 @router.get("/callback")
-async def callback(request: Request) -> JSONResponse:
+async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> JSONResponse:
     settings = get_settings()
 
     error = request.query_params.get("error")
@@ -78,7 +71,7 @@ async def callback(request: Request) -> JSONResponse:
     _pending_states.discard(state)
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(
+        token_response = await client.post(
             SPOTIFY_TOKEN_URL,
             data={
                 "grant_type": "authorization_code",
@@ -87,15 +80,45 @@ async def callback(request: Request) -> JSONResponse:
             },
             auth=(settings.spotify_client_id, settings.spotify_client_secret),
         )
+        if token_response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Spotify token exchange failed: {token_response.status_code} {token_response.text}",
+            )
+        token_data = token_response.json()
 
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Spotify token exchange failed: {response.status_code} {response.text}",
+        # Need the Spotify user id to key the `users` row on — it's the
+        # natural primary key and it's what /me gives us right away.
+        profile_response = await client.get(
+            f"{SPOTIFY_API_BASE}/me",
+            headers={"Authorization": f"Bearer {token_data['access_token']}"},
         )
+        if profile_response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Spotify profile request failed: {profile_response.status_code} {profile_response.text}",
+            )
+        profile = profile_response.json()
 
-    token_data = response.json()
-    session_id = _store_session(token_data)
+    spotify_id = profile["id"]
+    expires_at = time.time() + token_data.get("expires_in", 3600)
+
+    user = await db.get(User, spotify_id)
+    if user:
+        user.access_token = token_data["access_token"]
+        user.refresh_token = token_data.get("refresh_token", user.refresh_token)
+        user.expires_at = expires_at
+        user.display_name = profile.get("display_name")
+    else:
+        user = User(
+            spotify_id=spotify_id,
+            display_name=profile.get("display_name"),
+            access_token=token_data["access_token"],
+            refresh_token=token_data.get("refresh_token"),
+            expires_at=expires_at,
+        )
+        db.add(user)
+    await db.commit()
 
     resp = JSONResponse(
         {
@@ -107,8 +130,8 @@ async def callback(request: Request) -> JSONResponse:
     # NOTE: secure=False because local dev runs over plain http on 127.0.0.1.
     # Set secure=True once this is served over https.
     resp.set_cookie(
-        SESSION_COOKIE_NAME,
-        session_id,
+        USER_ID_COOKIE_NAME,
+        spotify_id,
         httponly=True,
         samesite="lax",
         max_age=60 * 60 * 24 * 30,
@@ -138,22 +161,30 @@ async def _refresh(refresh_token: str) -> dict:
     return response.json()
 
 
-async def get_session_token(request: Request) -> str:
-    """FastAPI dependency: resolve the caller's session cookie to a valid
-    Spotify access token, transparently refreshing it if it's expired."""
-    session_id = request.cookies.get(SESSION_COOKIE_NAME)
-    session = _sessions.get(session_id) if session_id else None
-    if not session:
+async def get_session_token(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> str:
+    """FastAPI dependency: resolve the caller's user-id cookie to a valid
+    Spotify access token, transparently refreshing it (and persisting the
+    refresh) if it's expired."""
+    spotify_id = request.cookies.get(USER_ID_COOKIE_NAME)
+    if not spotify_id:
+        raise HTTPException(status_code=401, detail="Not authenticated — visit /auth/login first.")
+
+    user = await db.get(User, spotify_id)
+    if not user:
         raise HTTPException(status_code=401, detail="Not authenticated — visit /auth/login first.")
 
     # 30s buffer so we don't hand out a token that expires mid-request.
-    if session["expires_at"] <= time.time() + 30:
-        if not session["refresh_token"]:
+    if user.expires_at <= time.time() + 30:
+        if not user.refresh_token:
             raise HTTPException(status_code=401, detail="Session expired — visit /auth/login again.")
-        refreshed = await _refresh(session["refresh_token"])
-        session["access_token"] = refreshed["access_token"]
-        session["expires_at"] = time.time() + refreshed.get("expires_in", 3600)
+        refreshed = await _refresh(user.refresh_token)
+        user.access_token = refreshed["access_token"]
+        user.expires_at = time.time() + refreshed.get("expires_in", 3600)
         # Spotify only sometimes rotates the refresh token.
-        session["refresh_token"] = refreshed.get("refresh_token", session["refresh_token"])
+        user.refresh_token = refreshed.get("refresh_token", user.refresh_token)
+        await db.commit()
 
-    return session["access_token"]
+    return user.access_token
