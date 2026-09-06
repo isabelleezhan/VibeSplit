@@ -1,10 +1,13 @@
 """LLM-based genre + mood/energy tagging. Tags every track.
 
-Tagging happens in fixed-size chunks rather than one call for the whole
-playlist. Chunks are processed sequentially (not concurrently) so each one 
-can be told which genre/mood tags earlier chunks already used — otherwise 
-a later chunk might independently invent "indie-rock" where an earlier one 
-used "indie rock".
+One call per playlist for anything up to CHUNK_SIZE tracks — chunking
+only kicks in as a safety net for genuinely huge playlists, not as the
+default path. Every chunk is a separate request against the free tier's
+small daily quota, so the common case should cost exactly one tagging
+call, not several. Chunks (when they happen) are processed sequentially
+(not concurrently) so each one can be told which genre/mood tags earlier
+chunks already used — otherwise a later chunk might independently invent
+"indie-rock" where an earlier one used "indie rock".
 
 Two separate tag dimensions come out of this:
   - genre tags: the musical genre itself ("pop", "hip hop", "house")
@@ -22,7 +25,8 @@ from pydantic import BaseModel
 
 from app.llm import generate_structured
 
-CHUNK_SIZE = 40 # Tracks per LLM call
+
+CHUNK_SIZE = 500
 
 _SYSTEM_PROMPT = (
     "You are a music metadata assistant. Given a list of tracks (each with a title "
@@ -79,14 +83,8 @@ def _build_prompt(tracks: list[dict], known_genre_tags: set[str], known_mood_tag
 
 
 async def tag_tracks(tracks: list[dict]) -> dict[str, dict[str, list[str]]]:
-    """Takes tracks with a `_tag_key` (see get_enriched_playlist_tracks —
-    the Spotify track id, or a positional fallback for local files that
-    often lack one), `name`, and `artists`. Returns
+    """Takes tracks with a `_tag_key`, `name`, and `artists`. Returns
     {tag_key: {"genres": [...], "moods": [...]}} for every track given.
-
-    Processes CHUNK_SIZE tracks per LLM call, sequentially — see the
-    module docstring for why this isn't one call for everything, and why
-    it isn't chunks run concurrently either.
     """
     if not tracks:
         return {}
