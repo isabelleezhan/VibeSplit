@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -19,6 +19,8 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 USER_ID_COOKIE_NAME = "spotify_user_id"
 
+# Read the user's saved library, read private playlists,
+# and create/modify playlists on their behalf.
 SCOPES = " ".join(
     [
         "user-library-read",
@@ -27,7 +29,7 @@ SCOPES = " ".join(
     ]
 )
 
-# Short-lived CSRF guard for the login->callback round trip 
+# Short-lived CSRF guard for the login->callback round trip.
 _pending_states: set[str] = set()
 
 
@@ -50,11 +52,15 @@ def login() -> RedirectResponse:
         "redirect_uri": settings.spotify_redirect_uri,
         "state": state,
     }
+    # Send the browser to Spotify's own login/consent page.
     return RedirectResponse(f"{SPOTIFY_AUTHORIZE_URL}?{urlencode(params)}")
 
 
 @router.get("/callback")
-async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> JSONResponse:
+async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> RedirectResponse:
+    # Spotify redirects the browser here after the user approves (or
+    # denies) access, appending `code`, `state`, and (on denial) `error`
+    # as query parameters.
     settings = get_settings()
 
     error = request.query_params.get("error")
@@ -68,8 +74,11 @@ async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)
         raise HTTPException(status_code=400, detail="Missing 'code' or 'state' in callback.")
     if state not in _pending_states:
         raise HTTPException(status_code=400, detail="Unknown or reused 'state' — possible CSRF, please retry /auth/login.")
+    
     _pending_states.discard(state)
 
+    # `async with httpx.AsyncClient()` opens an HTTP client for the
+    # duration of this block, closing its connections automatically
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
             SPOTIFY_TOKEN_URL,
@@ -87,8 +96,6 @@ async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)
             )
         token_data = token_response.json()
 
-        # Need the Spotify user id to key the `users` row on — it's the
-        # natural primary key and it's what /me gives us right away.
         profile_response = await client.get(
             f"{SPOTIFY_API_BASE}/me",
             headers={"Authorization": f"Bearer {token_data['access_token']}"},
@@ -103,6 +110,9 @@ async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)
     spotify_id = profile["id"]
     expires_at = time.time() + token_data.get("expires_in", 3600)
 
+    # Upsert: update the existing row if this user has logged in before,
+    # otherwise create a new one. `db.get(User, spotify_id)` is a
+    # primary-key lookup.
     user = await db.get(User, spotify_id)
     if user:
         user.access_token = token_data["access_token"]
@@ -120,18 +130,13 @@ async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)
         db.add(user)
     await db.commit()
 
-    resp = JSONResponse(
-        {
-            "message": "Spotify auth successful",
-            "scope": token_data.get("scope"),
-            "expires_in": token_data.get("expires_in"),
-        }
-    )
-    # NOTE: secure=False because local dev runs over plain http on 127.0.0.1.
-    # Set secure=True once this is served over https.
+    # Hand the browser back to the frontend app.
+    resp = RedirectResponse(settings.frontend_url)
     resp.set_cookie(
         USER_ID_COOKIE_NAME,
         spotify_id,
+        # httponly=True means client-side JavaScript can't read this
+        # cookie.
         httponly=True,
         samesite="lax",
         max_age=60 * 60 * 24 * 30,
@@ -140,6 +145,8 @@ async def callback(request: Request, db: Annotated[AsyncSession, Depends(get_db)
 
 
 async def _refresh(refresh_token: str) -> dict:
+    """Trade a refresh token for a new access token, once the old one's
+    expired. Same server-to-server pattern as the initial code exchange."""
     settings = get_settings()
 
     async with httpx.AsyncClient() as client:
@@ -161,13 +168,16 @@ async def _refresh(refresh_token: str) -> dict:
     return response.json()
 
 
-async def get_session_token(
+async def get_current_user(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> str:
-    """FastAPI dependency: resolve the caller's user-id cookie to a valid
-    Spotify access token, transparently refreshing it (and persisting the
-    refresh) if it's expired."""
+) -> User:
+    """FastAPI dependency: resolve the caller's user-id cookie to their
+    Postgres row, transparently refreshing the Spotify token (and
+    persisting the refresh) if it's expired. Returns the whole User row
+    rather than just the token, so a route that also needs the Spotify
+    user id (e.g. to create a playlist "for" them) doesn't need a second
+    cookie read."""
     spotify_id = request.cookies.get(USER_ID_COOKIE_NAME)
     if not spotify_id:
         raise HTTPException(status_code=401, detail="Not authenticated — visit /auth/login first.")
@@ -176,15 +186,22 @@ async def get_session_token(
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated — visit /auth/login first.")
 
-    # 30s buffer so we don't hand out a token that expires mid-request.
+    # 30s buffer.
     if user.expires_at <= time.time() + 30:
         if not user.refresh_token:
             raise HTTPException(status_code=401, detail="Session expired — visit /auth/login again.")
         refreshed = await _refresh(user.refresh_token)
         user.access_token = refreshed["access_token"]
         user.expires_at = time.time() + refreshed.get("expires_in", 3600)
-        # Spotify only sometimes rotates the refresh token.
+
         user.refresh_token = refreshed.get("refresh_token", user.refresh_token)
         await db.commit()
 
+    return user
+
+
+async def get_session_token(user: Annotated[User, Depends(get_current_user)]) -> str:
+    """FastAPI dependency: just the access token, for the common case of a
+    route that only talks to Spotify and never needs the user's own id.
+    Built on top of get_current_user."""
     return user.access_token
