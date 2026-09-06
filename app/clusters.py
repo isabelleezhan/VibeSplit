@@ -1,9 +1,11 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_session_token
 from app.clustering import cluster_tracks, compute_coherence, playlist_year_range
+from app.db import get_db
 from app.labeling import label_and_refine_clusters
 from app.tracks import get_enriched_playlist_tracks
 
@@ -14,11 +16,12 @@ router = APIRouter(prefix="/playlists", tags=["clusters"])
 async def get_playlist_clusters(
     playlist_id: str,
     access_token: Annotated[str, Depends(get_session_token)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict:
-    """Import tracks, enrich with genres, cluster by vibe, then have 
+    """Import tracks, enrich with genres, cluster by vibe, then have
     the LLM name each cluster and reassign misfit
     tracks to a better-fitting cluster."""
-    tracks = await get_enriched_playlist_tracks(playlist_id, access_token)
+    tracks = await get_enriched_playlist_tracks(playlist_id, access_token, db)
 
     # Fixed year basis so before/after scores are measured on the same scale
     year_range = playlist_year_range(tracks)
