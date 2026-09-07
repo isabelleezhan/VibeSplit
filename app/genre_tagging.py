@@ -1,14 +1,5 @@
 """LLM-based genre + mood/energy tagging. Tags every track.
 
-One call per playlist for anything up to CHUNK_SIZE tracks — chunking
-only kicks in as a safety net for genuinely huge playlists, not as the
-default path. Every chunk is a separate request against the free tier's
-small daily quota, so the common case should cost exactly one tagging
-call, not several. Chunks (when they happen) are processed sequentially
-(not concurrently) so each one can be told which genre/mood tags earlier
-chunks already used — otherwise a later chunk might independently invent
-"indie-rock" where an earlier one used "indie rock".
-
 Two separate tag dimensions come out of this:
   - genre tags: the musical genre itself ("pop", "hip hop", "house")
   - mood tags: energy/setting/vibe ("high-energy", "rave", "chill",
@@ -18,7 +9,8 @@ Tagging is per-track rather than per-artist. The prompt still asks the model
 to default to an artist's usual sound/mood and stay consistent across their 
 tracks.
 
-Uses Google's Gemini API (free tier) rather than a paid-only provider.
+Uses Groq's API (free tier) rather than a paid-only provider — see
+app/llm.py for why it's Groq specifically and not Gemini.
 """
 
 from pydantic import BaseModel
@@ -26,7 +18,7 @@ from pydantic import BaseModel
 from app.llm import generate_structured
 
 
-CHUNK_SIZE = 500
+CHUNK_SIZE = 20
 
 _SYSTEM_PROMPT = (
     "You are a music metadata assistant. Given a list of tracks (each with a title "
@@ -67,15 +59,27 @@ def _format_track(track: dict) -> str:
     return f"- [{track['_tag_key']}] \"{name}\" by {artists}"
 
 
+# Caps how many previously-seen tags get echoed back into a later chunk's
+# prompt. Without this, the "known tags so far" list grows every chunk —
+# on a long multi-chunk playlist, a late chunk's prompt could be
+# meaningfully bigger than an early one's just from this, on top of
+# already being tight against Groq's TPM limit (see CHUNK_SIZE). Any
+# real playlist's distinct genre/mood vocabulary should rarely even hit
+# these caps — this is a defensive bound, not an expected truncation.
+MAX_KNOWN_TAGS_IN_PROMPT = 40
+
+
 def _build_prompt(tracks: list[dict], known_genre_tags: set[str], known_mood_tags: set[str]) -> str:
     lines = []
     if known_genre_tags or known_mood_tags:
+        shown_genres = sorted(known_genre_tags)[:MAX_KNOWN_TAGS_IN_PROMPT]
+        shown_moods = sorted(known_mood_tags)[:MAX_KNOWN_TAGS_IN_PROMPT]
         lines.append(
             "Tags already used elsewhere in this playlist — reuse these exact "
             "spellings when they apply, rather than inventing a different wording "
             "for the same genre or mood:\n"
-            f"  genres so far: {', '.join(sorted(known_genre_tags)) or '(none yet)'}\n"
-            f"  moods so far: {', '.join(sorted(known_mood_tags)) or '(none yet)'}\n"
+            f"  genres so far: {', '.join(shown_genres) or '(none yet)'}\n"
+            f"  moods so far: {', '.join(shown_moods) or '(none yet)'}\n"
         )
     lines.append("Tracks:")
     lines.extend(_format_track(t) for t in tracks)

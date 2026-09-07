@@ -21,7 +21,7 @@ class User(Base):
 class TrackTagCache(Base):
     """Cached genre/mood tags per Spotify track id, so re-splitting a
     playlist (or splitting a different one that shares tracks with an
-    earlier one) doesn't re-spend Gemini's free-tier quota re-tagging
+    earlier one) doesn't re-spend the LLM's free-tier quota re-tagging
     tracks it already has an answer for. See app/tracks.py for how this
     gets read/written — local files (no stable Spotify id) are never
     cached, since there's nothing stable to key them by across runs."""

@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Without this, plain `pytest` (as opposed to `python -m pytest`, which
+# auto-adds the CWD to sys.path) can't find the `app` package — pytest's
+# own import-path handling only adds `tests/` itself, not the repo root.
+pythonpath = ["."]

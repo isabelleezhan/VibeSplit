@@ -22,8 +22,9 @@ class Settings(BaseSettings):
     database_url: str = ""
     redis_url: str = ""
 
-    # --- Gemini (genre tagging + cluster labeling) ---
-    gemini_api_key: str = ""
+    # --- Groq (genre tagging + cluster labeling) ---
+    # Free tier, no credit card — get a key at https://console.groq.com/keys
+    groq_api_key: str = ""
 
 @lru_cache
 def get_settings() -> Settings:

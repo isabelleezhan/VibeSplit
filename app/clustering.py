@@ -12,7 +12,7 @@ MOOD_WEIGHT = 0.3
 ERA_WEIGHT = 0.2
 
 MIN_CLUSTERS = 2
-MAX_CLUSTERS = 10
+MAX_CLUSTERS = 5
 NEUTRAL_DISTANCE = 0.5  # used when a numeric feature is missing on either side
 
 MIN_TRACKS_FOR_COHERENCE = 4

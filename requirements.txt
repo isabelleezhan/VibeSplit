@@ -6,4 +6,6 @@ httpx
 sqlalchemy[asyncio]
 asyncpg
 scikit-learn
-google-genai
+groq
+pytest
+pytest-asyncio
